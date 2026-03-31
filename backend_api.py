@@ -16,6 +16,7 @@ from app import (
     STUDENT_WORD_EXT,
     OUTPUT_DIR,
     grade_homework,
+    normalize_student_id,
     save_upload,
 )
 
@@ -44,6 +45,7 @@ def health() -> dict[str, str]:
 async def grade(
     question_file: UploadFile = File(..., description="题目文件: pdf/doc/docx/xls/xlsx"),
     student_file: UploadFile = File(..., description="学生作业: doc/docx"),
+    student_id: str = Form(..., description="学生ID(必填，支持字母/数字/_/-)"),
     teacher_material_files: list[UploadFile] | None = File(default=None, description="老师补充材料(可多文件)"),
     reference_file: UploadFile | None = File(default=None, description="老师批改样例(可选)"),
     protocol: str = Form(default="OpenAI兼容"),
@@ -53,6 +55,10 @@ async def grade(
 ) -> JSONResponse:
     if protocol not in {"OpenAI兼容", "Anthropic兼容"}:
         raise HTTPException(status_code=400, detail="protocol 仅支持 OpenAI兼容 或 Anthropic兼容")
+    try:
+        normalized_student_id = normalize_student_id(student_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
     _validate_upload(question_file.filename or "", QUESTION_EXT, "question_file")
     _validate_upload(student_file.filename or "", STUDENT_WORD_EXT, "student_file")
@@ -77,6 +83,7 @@ async def grade(
             grade_homework,
             question_path,
             student_path,
+            normalized_student_id,
             reference_path,
             teacher_paths,
             protocol,
@@ -94,6 +101,7 @@ async def grade(
         "job_id": job_id,
         "created_at": datetime.now().isoformat(),
         "overall": overall,
+        "student_id": normalized_student_id,
         "output_file": str(output_path.resolve()),
         "output_name": output_path.name,
     }
@@ -102,6 +110,7 @@ async def grade(
         {
             "job_id": job_id,
             "overall": overall,
+            "student_id": normalized_student_id,
             "output_file_name": output_path.name,
             "download_url": f"/api/v1/download/{job_id}",
         }

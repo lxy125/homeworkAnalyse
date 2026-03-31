@@ -38,6 +38,16 @@ def now_suffix() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
+def normalize_student_id(student_id: str) -> str:
+    value = student_id.strip()
+    if not value:
+        raise ValueError("学生ID不能为空。")
+    normalized = re.sub(r"[^0-9A-Za-z_-]+", "_", value).strip("_")
+    if not normalized:
+        raise ValueError("学生ID仅支持字母、数字、下划线和中划线。")
+    return normalized[:64]
+
+
 def normalize_text(text: str) -> str:
     cleaned = text.replace("\r", "\n")
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
@@ -248,6 +258,7 @@ def generate_annotation_plan(
 
 def annotate_word(
     student_path: Path,
+    student_id: str,
     output_dir: Path,
     protocol: str,
     api_key: str,
@@ -288,7 +299,9 @@ def annotate_word(
                 first_para = doc.Paragraphs(1).Range
                 doc.Comments.Add(Range=first_para, Text=f"总评：{plan['overall']}")
 
-            output_path = output_dir / f"{student_path.stem}-批改后-{now_suffix()}{student_path.suffix}"
+            output_path = output_dir / (
+                f"{student_path.stem}-学生ID-{student_id}-批改后-{now_suffix()}{student_path.suffix}"
+            )
             doc.SaveAs2(str(output_path.resolve()))
             return output_path, plan["overall"]
         finally:
@@ -300,6 +313,7 @@ def annotate_word(
 def grade_homework(
     question_path: Path,
     student_path: Path,
+    student_id: str,
     reference_path: Path | None,
     teacher_material_paths: list[Path] | None,
     protocol: str,
@@ -311,6 +325,7 @@ def grade_homework(
     ext = student_path.suffix.lower()
     if ext not in STUDENT_WORD_EXT:
         raise ValueError(f"待批改文件必须是Word格式(doc/docx)，当前为：{ext}")
+    normalized_student_id = normalize_student_id(student_id)
 
     teacher_paths = [question_path] + (teacher_material_paths or [])
     teacher_text_parts = []
@@ -319,14 +334,37 @@ def grade_homework(
         teacher_text_parts.append(extract_text(p))
     question_text = normalize_text("\n\n".join(teacher_text_parts))
     reference_text = extract_text(reference_path) if reference_path else ""
-    return annotate_word(student_path, output_dir, protocol, api_key, base_url, model, question_text, reference_text)
+    return annotate_word(
+        student_path,
+        normalized_student_id,
+        output_dir,
+        protocol,
+        api_key,
+        base_url,
+        model,
+        question_text,
+        reference_text,
+    )
 
 
 def save_upload(uploaded_file, target_dir: Path) -> Path:
     target_dir.mkdir(parents=True, exist_ok=True)
-    target = target_dir / uploaded_file.name
-    target.write_bytes(uploaded_file.getbuffer())
-    return target
+    file_name = getattr(uploaded_file, "name", None) or getattr(uploaded_file, "filename", None)
+    if not file_name:
+        raise ValueError("上传文件缺少文件名。")
+    target = target_dir / Path(file_name).name
+
+    if hasattr(uploaded_file, "getbuffer"):
+        target.write_bytes(uploaded_file.getbuffer())
+        return target
+
+    file_obj = getattr(uploaded_file, "file", None)
+    if file_obj is not None and hasattr(file_obj, "read"):
+        file_obj.seek(0)
+        target.write_bytes(file_obj.read())
+        return target
+
+    raise ValueError("不支持的上传文件对象类型。")
 
 
 def render_upload_summary(
@@ -334,8 +372,10 @@ def render_upload_summary(
     teacher_material_uploads,
     student_upload,
     reference_upload,
+    student_id: str,
 ) -> None:
     st.markdown("### 已上传文件")
+    st.write(f"- 学生ID：`{student_id.strip() or '未填写'}`")
     if question_upload:
         st.write(f"- 题目：`{question_upload.name}`")
     else:
@@ -380,6 +420,9 @@ def main() -> None:
         st.write("- 输出：批注后的 `doc/docx`")
 
     with st.form("grading_form"):
+        st.markdown("### 0) 填写学生ID")
+        student_id = st.text_input("学生ID（必填，仅用于标识和输出文件命名）")
+
         st.markdown("### 1) 上传题目")
         question_upload = st.file_uploader(
             "题目文件（必填）",
@@ -404,11 +447,14 @@ def main() -> None:
 
         submitted = st.form_submit_button("开始处理并生成批注Word", type="primary")
 
-    render_upload_summary(question_upload, teacher_material_uploads, student_upload, reference_upload)
+    render_upload_summary(question_upload, teacher_material_uploads, student_upload, reference_upload, student_id)
 
     if submitted:
         if not question_upload or not student_upload:
             st.error("请至少上传题目文件和学生待批改文件。")
+            return
+        if not student_id.strip():
+            st.error("请填写学生ID。")
             return
         if not api_key.strip():
             st.error("请填写 API Key。")
@@ -427,6 +473,7 @@ def main() -> None:
 
         with st.spinner("正在批改，请稍候..."):
             try:
+                normalized_student_id = normalize_student_id(student_id)
                 question_path = save_upload(question_upload, work_dir)
                 teacher_material_paths = [save_upload(f, work_dir) for f in (teacher_material_uploads or [])]
                 student_path = save_upload(student_upload, work_dir)
@@ -435,6 +482,7 @@ def main() -> None:
                 output_path, overall = grade_homework(
                     question_path,
                     student_path,
+                    normalized_student_id,
                     reference_path,
                     teacher_material_paths,
                     protocol,

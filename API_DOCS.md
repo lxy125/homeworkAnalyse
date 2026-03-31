@@ -39,6 +39,7 @@ python run_backend.py
 
 - `question_file` (file, 必填): 题目文件，支持 `pdf/doc/docx/xls/xlsx`
 - `student_file` (file, 必填): 学生作业，支持 `doc/docx`
+- `student_id` (text, 必填): 学生ID，用于任务标识和报告文件命名（仅支持字母/数字/_/-）
 - `teacher_material_files` (file[], 可选): 老师补充材料，多文件
 - `reference_file` (file, 可选): 老师批改样例
 - `protocol` (text, 可选): `OpenAI兼容` 或 `Anthropic兼容`，默认 `OpenAI兼容`
@@ -51,8 +52,9 @@ python run_backend.py
 ```json
 {
   "job_id": "b9d1f8b4f0f54f25ae9d1b4f88123456",
+  "student_id": "20260001",
   "overall": "整体完成较好，建议加强函数公式和数据透视细节。",
-  "output_file_name": "Excel实验报告-待批改-批改后-20260331_110000.docx",
+  "output_file_name": "Excel实验报告-待批改-学生ID-20260001-批改后-20260331_110000.docx",
   "download_url": "/api/v1/download/b9d1f8b4f0f54f25ae9d1b4f88123456"
 }
 ```
@@ -75,6 +77,7 @@ curl -X POST "http://127.0.0.1:8000/api/v1/grade" \
   -F "question_file=@D:/project/example/Excel实验题目要求.pdf" \
   -F "teacher_material_files=@D:/project/example/Excel实验原始素材文件.xlsx" \
   -F "student_file=@D:/project/example/Excel实验报告-待批改.docx" \
+  -F "student_id=20260001" \
   -F "reference_file=@D:/project/example/Excel实验报告-批改后.docx" \
   -F "protocol=OpenAI兼容" \
   -F "api_key=你的APIKEY" \

@@ -25,6 +25,7 @@ def main() -> None:
     output_path, overall = grade_homework(
         question_path=question_path,
         student_path=student_path,
+        student_id="demo_001",
         reference_path=reference_path,
         teacher_material_paths=[],
         protocol=protocol,
