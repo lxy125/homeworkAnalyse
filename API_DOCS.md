@@ -38,7 +38,7 @@ python run_backend.py
 ### 表单字段
 
 - `question_file` (file, 必填): 题目文件，支持 `pdf/doc/docx/xls/xlsx`
-- `student_file` (file, 必填): 学生作业，支持 `doc/docx`
+- `student_file` (file, 必填): 学生作业，支持 `doc/docx`（输出固定为 `docx`）
 - `student_id` (text, 必填): 学生ID，用于任务标识和报告文件命名（仅支持字母/数字/_/-）
 - `teacher_material_files` (file[], 可选): 老师补充材料，多文件
 - `reference_file` (file, 可选): 老师批改样例
@@ -90,3 +90,9 @@ curl -X POST "http://127.0.0.1:8000/api/v1/grade" \
 ```bash
 curl -L "http://127.0.0.1:8000/api/v1/download/<job_id>" -o graded.docx
 ```
+
+## Linux 兼容说明
+
+- 本接口可在 Linux 直接运行，不再依赖 Windows COM。
+- 上传 `.doc/.xls` 时，如服务器未安装 LibreOffice（`soffice`），会返回格式转换提示错误。
+- 建议生产环境统一上传 `.docx/.xlsx`。

@@ -1,16 +1,25 @@
 ﻿import json
 import os
 import re
+import shutil
+import subprocess
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import httpx
-import pythoncom
 import streamlit as st
-import win32com.client as win32
+from docx import Document
+from docx.opc.constants import CONTENT_TYPE as CT
+from docx.opc.constants import RELATIONSHIP_TYPE as RT
+from docx.opc.packuri import PackURI
+from docx.opc.part import XmlPart
+from docx.oxml import OxmlElement, parse_xml
+from docx.oxml.ns import nsdecls, qn
 from dotenv import load_dotenv
 from openai import OpenAI
+from openpyxl import load_workbook
 from pypdf import PdfReader
 
 load_dotenv()
@@ -22,16 +31,6 @@ QUESTION_EXT = {".doc", ".docx", ".pdf", ".xls", ".xlsx"}
 STUDENT_WORD_EXT = {".doc", ".docx"}
 OUTPUT_DIR = Path("outputs")
 OUTPUT_DIR.mkdir(exist_ok=True)
-
-
-class ComScope:
-    def __enter__(self):
-        pythoncom.CoInitialize()
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        pythoncom.CoUninitialize()
-        return False
 
 
 def now_suffix() -> str:
@@ -119,6 +118,47 @@ def call_model(protocol: str, api_key: str, base_url: str, model: str, system_pr
     return call_openai_compatible(api_key, base_url, model, system_prompt, user_prompt)
 
 
+def convert_legacy_office_file(file_path: Path, target_ext: str) -> Path:
+    soffice = shutil.which("soffice")
+    if not soffice:
+        raise ValueError(
+            f"文件 `{file_path.name}` 为旧格式 `{file_path.suffix}`，当前环境无法直接解析。"
+            f"请改传 `{target_ext}`，或在服务器安装 LibreOffice（soffice）后自动转换。"
+        )
+
+    temp_dir = Path(tempfile.mkdtemp(prefix="office_convert_"))
+    convert_to = target_ext.lstrip(".")
+    result = subprocess.run(
+        [soffice, "--headless", "--convert-to", convert_to, "--outdir", str(temp_dir), str(file_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    converted = temp_dir / f"{file_path.stem}.{convert_to}"
+    if result.returncode != 0 or not converted.exists():
+        err = (result.stderr or result.stdout or "").strip()
+        raise ValueError(f"无法将 `{file_path.name}` 转换为 `{target_ext}`。{err}")
+    return converted
+
+
+def ensure_docx(file_path: Path) -> Path:
+    ext = file_path.suffix.lower()
+    if ext == ".docx":
+        return file_path
+    if ext == ".doc":
+        return convert_legacy_office_file(file_path, ".docx")
+    raise ValueError(f"不支持的Word文件类型: {ext}")
+
+
+def ensure_xlsx(file_path: Path) -> Path:
+    ext = file_path.suffix.lower()
+    if ext == ".xlsx":
+        return file_path
+    if ext == ".xls":
+        return convert_legacy_office_file(file_path, ".xlsx")
+    raise ValueError(f"不支持的Excel文件类型: {ext}")
+
+
 def extract_text_from_pdf(file_path: Path) -> str:
     reader = PdfReader(str(file_path))
     text = []
@@ -128,54 +168,32 @@ def extract_text_from_pdf(file_path: Path) -> str:
 
 
 def extract_text_from_word(file_path: Path) -> str:
-    with ComScope():
-        word = win32.Dispatch("Word.Application")
-        word.Visible = False
-        word.DisplayAlerts = 0
-        doc = None
-        try:
-            doc = word.Documents.Open(str(file_path.resolve()), ReadOnly=True)
-            lines = []
-            for i in range(1, doc.Paragraphs.Count + 1):
-                raw = doc.Paragraphs(i).Range.Text
-                txt = raw.replace("\r", "").replace("\x07", "").strip()
-                if txt:
-                    lines.append(txt)
-            return normalize_text("\n".join(lines))
-        finally:
-            if doc is not None:
-                doc.Close(False)
-            word.Quit()
+    docx_path = ensure_docx(file_path)
+    doc = Document(str(docx_path))
+    lines = []
+    for para in doc.paragraphs:
+        txt = para.text.strip()
+        if txt:
+            lines.append(txt)
+    return normalize_text("\n".join(lines))
 
 
 def extract_text_from_excel(file_path: Path) -> str:
-    with ComScope():
-        excel = win32.Dispatch("Excel.Application")
-        excel.Visible = False
-        excel.DisplayAlerts = False
-        wb = None
-        try:
-            wb = excel.Workbooks.Open(str(file_path.resolve()), ReadOnly=True)
-            lines = []
-            for ws in wb.Worksheets:
-                used = ws.UsedRange
-                row_count = used.Rows.Count
-                col_count = used.Columns.Count
-                start_row = used.Row
-                start_col = used.Column
-                for r in range(start_row, start_row + row_count):
-                    row_values = []
-                    for c in range(start_col, start_col + col_count):
-                        val = ws.Cells(r, c).Value
-                        if val is not None and str(val).strip():
-                            row_values.append(str(val).strip())
-                    if row_values:
-                        lines.append(f"[{ws.Name}] " + " | ".join(row_values))
-            return normalize_text("\n".join(lines))
-        finally:
-            if wb is not None:
-                wb.Close(False)
-            excel.Quit()
+    xlsx_path = ensure_xlsx(file_path)
+    wb = load_workbook(str(xlsx_path), data_only=True, read_only=True)
+    try:
+        lines = []
+        for ws in wb.worksheets:
+            for row in ws.iter_rows(values_only=True):
+                row_values = []
+                for val in row:
+                    if val is not None and str(val).strip():
+                        row_values.append(str(val).strip())
+                if row_values:
+                    lines.append(f"[{ws.title}] " + " | ".join(row_values))
+        return normalize_text("\n".join(lines))
+    finally:
+        wb.close()
 
 
 def extract_text(file_path: Path) -> str:
@@ -256,6 +274,87 @@ def generate_annotation_plan(
     return {"overall": overall[:120], "items": normalized_items}
 
 
+def get_or_add_comments_part(document: Document) -> XmlPart:
+    doc_part = document.part
+    for rel in doc_part.rels.values():
+        if rel.reltype == RT.COMMENTS:
+            return rel.target_part
+
+    comments_xml = parse_xml(f"<w:comments {nsdecls('w')}/>")
+    comments_part = XmlPart(PackURI("/word/comments.xml"), CT.WML_COMMENTS, comments_xml, doc_part.package)
+    doc_part.relate_to(comments_part, RT.COMMENTS)
+    return comments_part
+
+
+def next_comment_id(comments_part: XmlPart) -> int:
+    comments_root = comments_part.element
+    max_id = -1
+    for node in comments_root.findall(qn("w:comment")):
+        raw = node.get(qn("w:id"))
+        if raw is None:
+            continue
+        try:
+            max_id = max(max_id, int(raw))
+        except ValueError:
+            continue
+    return max_id + 1
+
+
+def add_comment_to_paragraph(document: Document, paragraph: Any, comment_text: str, author: str = "AI批改助手") -> None:
+    text = comment_text.strip()
+    if not text:
+        return
+
+    comments_part = get_or_add_comments_part(document)
+    cid = next_comment_id(comments_part)
+
+    comment = OxmlElement("w:comment")
+    comment.set(qn("w:id"), str(cid))
+    comment.set(qn("w:author"), author)
+    comment.set(qn("w:initials"), "AI")
+    comment.set(qn("w:date"), datetime.utcnow().replace(microsecond=0).isoformat() + "Z")
+
+    p = OxmlElement("w:p")
+    r = OxmlElement("w:r")
+    t = OxmlElement("w:t")
+    t.text = text
+    r.append(t)
+    p.append(r)
+    comment.append(p)
+    comments_part.element.append(comment)
+
+    p_elm = paragraph._p
+    runs = [child for child in p_elm.iterchildren() if child.tag == qn("w:r")]
+    if not runs:
+        paragraph.add_run(" ")
+        runs = [child for child in p_elm.iterchildren() if child.tag == qn("w:r")]
+
+    if not runs:
+        return
+
+    first_run = runs[0]
+    last_run = runs[-1]
+
+    range_start = OxmlElement("w:commentRangeStart")
+    range_start.set(qn("w:id"), str(cid))
+    first_run.addprevious(range_start)
+
+    range_end = OxmlElement("w:commentRangeEnd")
+    range_end.set(qn("w:id"), str(cid))
+    last_run.addnext(range_end)
+
+    ref_run = OxmlElement("w:r")
+    rpr = OxmlElement("w:rPr")
+    rstyle = OxmlElement("w:rStyle")
+    rstyle.set(qn("w:val"), "CommentReference")
+    rpr.append(rstyle)
+    ref_run.append(rpr)
+    cref = OxmlElement("w:commentReference")
+    cref.set(qn("w:id"), str(cid))
+    ref_run.append(cref)
+    range_end.addnext(ref_run)
+
+
 def annotate_word(
     student_path: Path,
     student_id: str,
@@ -267,47 +366,35 @@ def annotate_word(
     question_text: str,
     reference_text: str,
 ) -> tuple[Path, str]:
-    with ComScope():
-        word = win32.Dispatch("Word.Application")
-        word.Visible = False
-        word.DisplayAlerts = 0
-        doc = None
-        try:
-            doc = word.Documents.Open(str(student_path.resolve()))
-            segments = []
-            paragraph_map: dict[int, Any] = {}
-            idx = 1
-            for i in range(1, doc.Paragraphs.Count + 1):
-                para = doc.Paragraphs(i)
-                txt = para.Range.Text.replace("\r", "").replace("\x07", "").strip()
-                if txt:
-                    segments.append({"index": idx, "text": txt})
-                    paragraph_map[idx] = para
-                    idx += 1
+    docx_path = ensure_docx(student_path)
+    doc = Document(str(docx_path))
 
-            plan = generate_annotation_plan(
-                protocol, api_key, base_url, model, question_text, segments, "Word段落", reference_text
-            )
+    segments = []
+    segment_map: dict[int, tuple[Any, str]] = {}
+    idx = 1
+    for para in doc.paragraphs:
+        txt = para.text.strip()
+        if txt:
+            segments.append({"index": idx, "text": txt})
+            segment_map[idx] = (para, txt)
+            idx += 1
 
-            for item in plan["items"]:
-                para = paragraph_map.get(item["index"])
-                if para is None:
-                    continue
-                doc.Comments.Add(Range=para.Range, Text=item["comment"])
+    plan = generate_annotation_plan(protocol, api_key, base_url, model, question_text, segments, "Word段落", reference_text)
 
-            if doc.Paragraphs.Count >= 1:
-                first_para = doc.Paragraphs(1).Range
-                doc.Comments.Add(Range=first_para, Text=f"总评：{plan['overall']}")
+    if doc.paragraphs:
+        add_comment_to_paragraph(doc, doc.paragraphs[0], f"总评：{plan['overall']}")
 
-            output_path = output_dir / (
-                f"{student_path.stem}-学生ID-{student_id}-批改后-{now_suffix()}{student_path.suffix}"
-            )
-            doc.SaveAs2(str(output_path.resolve()))
-            return output_path, plan["overall"]
-        finally:
-            if doc is not None:
-                doc.Close(False)
-            word.Quit()
+    for item in plan["items"]:
+        mapped = segment_map.get(item["index"])
+        if not mapped:
+            continue
+        para, _ = mapped
+        add_comment_to_paragraph(doc, para, item["comment"])
+
+    output_path = output_dir / f"{student_path.stem}-学生ID-{student_id}-批改后-{now_suffix()}.docx"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    doc.save(str(output_path.resolve()))
+    return output_path, plan["overall"]
 
 
 def grade_homework(
@@ -417,7 +504,8 @@ def main() -> None:
         st.markdown("### 支持格式")
         st.write("- 题目/材料：`pdf/doc/docx/xls/xlsx`")
         st.write("- 学生作业：`doc/docx`")
-        st.write("- 输出：批注后的 `doc/docx`")
+        st.write("- 输出：批注后的 `docx`")
+        st.caption("提示：Linux 环境处理 .doc/.xls 需要安装 LibreOffice（soffice）自动转换。")
 
     with st.form("grading_form"):
         st.markdown("### 0) 填写学生ID")

@@ -7,7 +7,7 @@
 3. 填写学生ID（必填，用于输出命名）
 4. 学生上传待批改作业（仅 `doc/docx`）
 5. 可选上传老师历史批改样例（同格式）
-6. 系统调用 `doubao-seed-2.0-pro` 生成批注并写回 Word 文档（文件名包含学生ID）
+6. 系统调用 `doubao-seed-2.0-pro` 生成批注并输出 Word 文档（文件名包含学生ID）
 
 ## 环境
 
@@ -74,4 +74,10 @@ python run_example.py
 
 - 题目文件：支持读取 `.doc/.docx/.pdf/.xls/.xlsx`
 - 学生作业：仅支持 `.doc/.docx`
-- 批注输出：Word 原生“批注”形式
+- 批注输出：`docx`，以 Word 原生“批注（评论气泡）”写入
+
+Linux 部署说明：
+
+- 本项目已移除 Windows COM 依赖，可直接运行在 Linux。
+- 若上传 `.doc/.xls` 旧格式，需服务器安装 LibreOffice（`soffice`）用于自动转换。
+- 建议优先上传 `.docx/.xlsx`，可避免格式转换依赖。

@@ -18,9 +18,9 @@ def main() -> None:
     model = os.getenv("ARK_MODEL", DEFAULT_MODEL)
 
     root = Path(__file__).resolve().parent
-    question_path = root / "example" / "对象与类作业-题目.pdf"
-    student_path = root / "example" / "对象与类作业-待批改.doc"
-    reference_path = root / "example" / "对象与类作业-批改后.doc"
+    question_path = root / "example" / "Excel实验题目要求.pdf"
+    student_path = root / "example" / "Excel实验报告-待批改.docx"
+    reference_path = root / "example" / "Excel实验报告-批改后.docx"
 
     output_path, overall = grade_homework(
         question_path=question_path,
