@@ -22,7 +22,7 @@ def main() -> None:
     student_path = root / "example" / "Excel实验报告-待批改.docx"
     reference_path = root / "example" / "Excel实验报告-批改后.docx"
 
-    output_path, overall = grade_homework(
+    output_path, overall, analysis_path = grade_homework(
         question_path=question_path,
         student_path=student_path,
         student_id="demo_001",
@@ -36,6 +36,7 @@ def main() -> None:
     )
 
     print(str(output_path.resolve()))
+    print(str(analysis_path.resolve()))
     print(overall)
 
 

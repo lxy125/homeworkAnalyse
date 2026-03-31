@@ -274,6 +274,150 @@ def generate_annotation_plan(
     return {"overall": overall[:120], "items": normalized_items}
 
 
+def generate_learning_analysis(
+    protocol: str,
+    api_key: str,
+    base_url: str,
+    model: str,
+    student_id: str,
+    question_text: str,
+    student_text: str,
+    reference_text: str = "",
+) -> dict[str, Any]:
+    system_prompt = (
+        "你是教学评估专家。你只返回JSON，不要返回Markdown或解释。"
+        "结论应客观、可落地、可用于教学跟进。"
+    )
+    user_prompt = f"""
+请基于题目要求和学生作答，输出该学生的学情分析。
+
+输出JSON格式必须是：
+{{
+  "student_id": "{student_id}",
+  "overall_mastery": "总体掌握结论，不超过80字",
+  "requirements": [
+    {{
+      "point": "题目要求点",
+      "status": "已完成/部分完成/未完成",
+      "evidence": "作答证据，不超过80字",
+      "advice": "改进建议，不超过60字"
+    }}
+  ],
+  "knowledge_mastery": [
+    {{
+      "topic": "知识点",
+      "level": "熟练/基本掌握/待加强",
+      "analysis": "分析，不超过80字"
+    }}
+  ]
+}}
+
+要求：
+1) requirements 至少3条，最多8条，尽量覆盖题目关键要求。
+2) status 仅能使用：已完成、部分完成、未完成。
+3) knowledge_mastery 至少3条，最多8条。
+4) 不要输出任何JSON以外文本。
+
+题目与教师材料：
+{question_text[:8000]}
+
+参考样例（可选）：
+{reference_text[:3000] if reference_text else '无'}
+
+学生作答：
+{student_text[:8000]}
+""".strip()
+
+    raw = call_model(protocol, api_key, base_url, model, system_prompt, user_prompt)
+    parsed = extract_json(raw)
+    if not parsed:
+        return {
+            "student_id": student_id,
+            "overall_mastery": "当前可完成基础要求，综合应用与细节准确性仍需提升。",
+            "requirements": [],
+            "knowledge_mastery": [],
+        }
+
+    overall = str(parsed.get("overall_mastery", "")).strip() or "当前可完成基础要求，综合应用与细节准确性仍需提升。"
+
+    requirements = []
+    for item in parsed.get("requirements", []):
+        point = str(item.get("point", "")).strip()
+        status = str(item.get("status", "")).strip()
+        evidence = str(item.get("evidence", "")).strip()
+        advice = str(item.get("advice", "")).strip()
+        if not point:
+            continue
+        if status not in {"已完成", "部分完成", "未完成"}:
+            status = "部分完成"
+        requirements.append(
+            {
+                "point": point[:120],
+                "status": status,
+                "evidence": evidence[:160],
+                "advice": advice[:120],
+            }
+        )
+
+    knowledge_mastery = []
+    for item in parsed.get("knowledge_mastery", []):
+        topic = str(item.get("topic", "")).strip()
+        level = str(item.get("level", "")).strip()
+        analysis = str(item.get("analysis", "")).strip()
+        if not topic:
+            continue
+        if level not in {"熟练", "基本掌握", "待加强"}:
+            level = "基本掌握"
+        knowledge_mastery.append(
+            {
+                "topic": topic[:120],
+                "level": level,
+                "analysis": analysis[:160],
+            }
+        )
+
+    return {
+        "student_id": student_id,
+        "overall_mastery": overall[:160],
+        "requirements": requirements[:8],
+        "knowledge_mastery": knowledge_mastery[:8],
+    }
+
+
+def save_learning_analysis_report(student_id: str, student_path: Path, analysis: dict[str, Any], output_dir: Path) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    report_path = output_dir / f"{student_path.stem}-学生ID-{student_id}-学情分析-{now_suffix()}.docx"
+
+    doc = Document()
+    doc.add_heading("学情分析报告", level=1)
+    doc.add_paragraph(f"学生ID：{analysis.get('student_id') or student_id}")
+    doc.add_paragraph(f"综合掌握结论：{analysis.get('overall_mastery', '')}")
+
+    doc.add_heading("题目要求完成情况", level=2)
+    requirements = analysis.get("requirements", [])
+    if requirements:
+        for idx, item in enumerate(requirements, start=1):
+            doc.add_paragraph(f"{idx}. 要求点：{item.get('point', '')}")
+            doc.add_paragraph(f"完成状态：{item.get('status', '')}")
+            doc.add_paragraph(f"作答证据：{item.get('evidence', '') or '未提取到明确证据'}")
+            doc.add_paragraph(f"改进建议：{item.get('advice', '') or '建议补充关键步骤与依据'}")
+    else:
+        doc.add_paragraph("1. 暂未提取到结构化要求点，请结合批注报告复核。")
+
+    doc.add_heading("知识掌握程度分析", level=2)
+    knowledges = analysis.get("knowledge_mastery", [])
+    if knowledges:
+        for idx, item in enumerate(knowledges, start=1):
+            doc.add_paragraph(f"{idx}. 知识点：{item.get('topic', '')}")
+            doc.add_paragraph(f"掌握程度：{item.get('level', '')}")
+            doc.add_paragraph(f"分析：{item.get('analysis', '') or '建议在练习中强化迁移应用。'}")
+    else:
+        doc.add_paragraph("1. 暂未提取到结构化知识点，请结合批注报告复核。")
+
+    doc.save(str(report_path.resolve()))
+    return report_path
+
+
 def get_or_add_comments_part(document: Document) -> XmlPart:
     doc_part = document.part
     for rel in doc_part.rels.values():
@@ -365,7 +509,7 @@ def annotate_word(
     model: str,
     question_text: str,
     reference_text: str,
-) -> tuple[Path, str]:
+) -> tuple[Path, str, str]:
     docx_path = ensure_docx(student_path)
     doc = Document(str(docx_path))
 
@@ -394,7 +538,8 @@ def annotate_word(
     output_path = output_dir / f"{student_path.stem}-学生ID-{student_id}-批改后-{now_suffix()}.docx"
     output_dir.mkdir(parents=True, exist_ok=True)
     doc.save(str(output_path.resolve()))
-    return output_path, plan["overall"]
+    student_text = normalize_text("\n".join([item["text"] for item in segments]))
+    return output_path, plan["overall"], student_text
 
 
 def grade_homework(
@@ -408,7 +553,7 @@ def grade_homework(
     base_url: str,
     model: str,
     output_dir: Path,
-) -> tuple[Path, str]:
+) -> tuple[Path, str, Path]:
     ext = student_path.suffix.lower()
     if ext not in STUDENT_WORD_EXT:
         raise ValueError(f"待批改文件必须是Word格式(doc/docx)，当前为：{ext}")
@@ -421,7 +566,7 @@ def grade_homework(
         teacher_text_parts.append(extract_text(p))
     question_text = normalize_text("\n\n".join(teacher_text_parts))
     reference_text = extract_text(reference_path) if reference_path else ""
-    return annotate_word(
+    output_path, overall, student_text = annotate_word(
         student_path,
         normalized_student_id,
         output_dir,
@@ -432,6 +577,18 @@ def grade_homework(
         question_text,
         reference_text,
     )
+    analysis = generate_learning_analysis(
+        protocol=protocol,
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
+        student_id=normalized_student_id,
+        question_text=question_text,
+        student_text=student_text,
+        reference_text=reference_text,
+    )
+    analysis_path = save_learning_analysis_report(normalized_student_id, student_path, analysis, output_dir)
+    return output_path, overall, analysis_path
 
 
 def save_upload(uploaded_file, target_dir: Path) -> Path:
@@ -567,7 +724,7 @@ def main() -> None:
                 student_path = save_upload(student_upload, work_dir)
                 reference_path = save_upload(reference_upload, work_dir) if reference_upload else None
 
-                output_path, overall = grade_homework(
+                output_path, overall, analysis_path = grade_homework(
                     question_path,
                     student_path,
                     normalized_student_id,
@@ -583,11 +740,18 @@ def main() -> None:
                 st.success("批改完成")
                 st.write(f"总评：{overall}")
                 st.code(f"输出文件：{output_path.resolve()}")
+                st.code(f"学情分析：{analysis_path.resolve()}")
                 st.download_button(
                     "下载批改后文件",
                     data=output_path.read_bytes(),
                     file_name=output_path.name,
                     mime="application/octet-stream",
+                )
+                st.download_button(
+                    "下载学情分析",
+                    data=analysis_path.read_bytes(),
+                    file_name=analysis_path.name,
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 )
             except Exception as exc:
                 st.error(f"批改失败：{exc}")

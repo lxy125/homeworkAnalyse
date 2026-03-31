@@ -79,7 +79,7 @@ async def grade(
     teacher_paths = [save_upload(f, work_dir) for f in material_files]
 
     try:
-        output_path, overall = await run_in_threadpool(
+        output_path, overall, analysis_path = await run_in_threadpool(
             grade_homework,
             question_path,
             student_path,
@@ -104,6 +104,8 @@ async def grade(
         "student_id": normalized_student_id,
         "output_file": str(output_path.resolve()),
         "output_name": output_path.name,
+        "analysis_file": str(analysis_path.resolve()),
+        "analysis_name": analysis_path.name,
     }
 
     return JSONResponse(
@@ -112,7 +114,9 @@ async def grade(
             "overall": overall,
             "student_id": normalized_student_id,
             "output_file_name": output_path.name,
+            "analysis_file_name": analysis_path.name,
             "download_url": f"/api/v1/download/{job_id}",
+            "analysis_download_url": f"/api/v1/download-analysis/{job_id}",
         }
     )
 
@@ -136,3 +140,20 @@ def download(job_id: str) -> FileResponse:
         raise HTTPException(status_code=404, detail="输出文件不存在")
 
     return FileResponse(path=str(file_path), filename=info["output_name"], media_type="application/octet-stream")
+
+
+@api.get("/api/v1/download-analysis/{job_id}")
+def download_analysis(job_id: str) -> FileResponse:
+    info = JOBS.get(job_id)
+    if not info:
+        raise HTTPException(status_code=404, detail="job_id 不存在")
+
+    file_path = Path(info["analysis_file"])
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="学情分析文件不存在")
+
+    return FileResponse(
+        path=str(file_path),
+        filename=info["analysis_name"],
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )

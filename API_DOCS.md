@@ -55,7 +55,9 @@ python run_backend.py
   "student_id": "20260001",
   "overall": "整体完成较好，建议加强函数公式和数据透视细节。",
   "output_file_name": "Excel实验报告-待批改-学生ID-20260001-批改后-20260331_110000.docx",
-  "download_url": "/api/v1/download/b9d1f8b4f0f54f25ae9d1b4f88123456"
+  "analysis_file_name": "Excel实验报告-待批改-学生ID-20260001-学情分析-20260331_110005.docx",
+  "download_url": "/api/v1/download/b9d1f8b4f0f54f25ae9d1b4f88123456",
+  "analysis_download_url": "/api/v1/download-analysis/b9d1f8b4f0f54f25ae9d1b4f88123456"
 }
 ```
 
@@ -69,6 +71,12 @@ python run_backend.py
 - 方法：`GET`
 - 路径：`/api/v1/download/{job_id}`
 - 返回：文件流（二进制）
+
+## 5. 下载学情分析文件
+
+- 方法：`GET`
+- 路径：`/api/v1/download-analysis/{job_id}`
+- 返回：Word 文件（`.docx`）
 
 ## curl 调用示例
 
@@ -89,6 +97,7 @@ curl -X POST "http://127.0.0.1:8000/api/v1/grade" \
 
 ```bash
 curl -L "http://127.0.0.1:8000/api/v1/download/<job_id>" -o graded.docx
+curl -L "http://127.0.0.1:8000/api/v1/download-analysis/<job_id>" -o learning_analysis.docx
 ```
 
 ## Linux 兼容说明
