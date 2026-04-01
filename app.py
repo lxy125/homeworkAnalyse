@@ -4,6 +4,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -26,9 +27,29 @@ load_dotenv()
 
 DEFAULT_OPENAI_BASE_URL = "https://ark.cn-beijing.volces.com/api/coding/v3"
 DEFAULT_ANTHROPIC_BASE_URL = "https://ark.cn-beijing.volces.com/api/coding"
+DEFAULT_ARK_FILE_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 DEFAULT_MODEL = "doubao-seed-2.0-pro"
 QUESTION_EXT = {".doc", ".docx", ".pdf", ".xls", ".xlsx"}
 STUDENT_WORD_EXT = {".doc", ".docx"}
+FILE_API_SUPPORTED_EXT = {
+    ".pdf",
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".gif",
+    ".webp",
+    ".bmp",
+    ".tiff",
+    ".ico",
+    ".icns",
+    ".sgi",
+    ".jp2",
+    ".heic",
+    ".heif",
+    ".mp4",
+    ".avi",
+    ".mov",
+}
 OUTPUT_DIR = Path("outputs")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
@@ -116,6 +137,113 @@ def call_model(protocol: str, api_key: str, base_url: str, model: str, system_pr
     if protocol == "Anthropic兼容":
         return call_anthropic_compatible(api_key, base_url, model, system_prompt, user_prompt)
     return call_openai_compatible(api_key, base_url, model, system_prompt, user_prompt)
+
+
+def _extract_response_text(response: Any) -> str:
+    text = (getattr(response, "output_text", "") or "").strip()
+    if text:
+        return text
+
+    chunks: list[str] = []
+    for output_item in getattr(response, "output", []) or []:
+        for content in getattr(output_item, "content", []) or []:
+            content_type = getattr(content, "type", "")
+            if content_type in {"output_text", "text"}:
+                value = getattr(content, "text", "") or ""
+                if value.strip():
+                    chunks.append(value.strip())
+    return "\n".join(chunks).strip()
+
+
+def resolve_file_api_base_url(base_url: str) -> str:
+    env_url = os.getenv("ARK_FILE_BASE_URL", "").strip()
+    if env_url:
+        return env_url
+
+    normalized = base_url.rstrip("/")
+    if normalized.endswith("/api/coding/v3"):
+        return normalized[: -len("/api/coding/v3")] + "/api/v3"
+    if normalized.endswith("/api/coding"):
+        return normalized[: -len("/api/coding")] + "/api/v3"
+    return DEFAULT_ARK_FILE_BASE_URL
+
+
+def _file_status(meta: Any) -> str:
+    status = getattr(meta, "status", None)
+    if isinstance(status, str) and status:
+        return status
+    if isinstance(meta, dict):
+        raw = meta.get("status")
+        if isinstance(raw, str):
+            return raw
+    return ""
+
+
+def split_file_api_supported(paths: list[Path]) -> tuple[list[Path], list[Path]]:
+    supported: list[Path] = []
+    unsupported: list[Path] = []
+    for p in paths:
+        if p.suffix.lower() in FILE_API_SUPPORTED_EXT:
+            supported.append(p)
+        else:
+            unsupported.append(p)
+    return supported, unsupported
+
+
+def call_openai_compatible_with_files(
+    api_key: str,
+    base_url: str,
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    file_paths: list[Path],
+) -> str:
+    file_base_url = resolve_file_api_base_url(base_url)
+    client = OpenAI(api_key=api_key, base_url=file_base_url)
+    uploaded_file_ids: list[str] = []
+    try:
+        for file_path in file_paths:
+            with file_path.open("rb") as f:
+                uploaded = client.files.create(file=(file_path.name, f), purpose="user_data")
+                uploaded_file_ids.append(uploaded.id)
+            deadline = time.time() + 300
+            while True:
+                meta = client.files.retrieve(uploaded.id)
+                status = _file_status(meta)
+                if status == "active":
+                    break
+                if status in {"failed", "error"}:
+                    raise RuntimeError(f"文件预处理失败: {file_path.name}")
+                if time.time() >= deadline:
+                    raise TimeoutError(f"等待文件预处理超时: {file_path.name}")
+                time.sleep(1.0)
+
+        user_content = [{"type": "input_text", "text": user_prompt}]
+        for fid in uploaded_file_ids:
+            user_content.append({"type": "input_file", "file_id": fid})
+
+        response = client.responses.create(
+            model=model,
+            temperature=0.2,
+            max_output_tokens=1800,
+            input=[
+                {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
+                {"role": "user", "content": user_content},
+            ],
+        )
+        return _extract_response_text(response)
+    finally:
+        for fid in uploaded_file_ids:
+            try:
+                client.files.delete(fid)
+            except Exception:
+                continue
+
+
+def is_file_input_unsupported_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    keywords = ["404", "/files", "notfound", "unsupported", "input_file", "file type not supported"]
+    return any(k in text for k in keywords)
 
 
 def convert_legacy_office_file(file_path: Path, target_ext: str) -> Path:
@@ -216,6 +344,9 @@ def generate_annotation_plan(
     student_segments: list[dict[str, Any]],
     segment_hint: str,
     reference_text: str = "",
+    question_file_paths: list[Path] | None = None,
+    reference_file_path: Path | None = None,
+    use_model_file_inputs: bool = False,
 ) -> dict[str, Any]:
     system_prompt = (
         "你是严谨且鼓励式的老师。你只返回JSON，不要返回Markdown或解释。"
@@ -227,7 +358,34 @@ def generate_annotation_plan(
     for item in limited_segments:
         serialized.append(f"index={item['index']} | content={item['text']}")
 
-    user_prompt = f"""
+    if use_model_file_inputs:
+        material_names = [p.name for p in (question_file_paths or [])]
+        if reference_file_path:
+            material_names.append(reference_file_path.name)
+        materials_desc = "、".join(material_names) if material_names else "未附加"
+        user_prompt = f"""
+请依据题目与学生作答给出批注计划。
+
+输出JSON格式必须是：
+{{
+  "overall": "总评，不超过80字",
+  "items": [
+    {{"index": 1, "comment": "该段批注，不超过40字"}}
+  ]
+}}
+
+要求：
+1) items 只包含需要批注的条目，最多10条。
+2) index 必须来自我提供的 index。
+3) comment 使用中文。
+4) 不要输出任何JSON以外文本。
+5) 题目、材料和参考样例已经作为文件附件提供：{materials_desc}。
+
+学生作答条目（{segment_hint}）：
+{chr(10).join(serialized)}
+""".strip()
+    else:
+        user_prompt = f"""
 请依据题目与学生作答给出批注计划。
 
 输出JSON格式必须是：
@@ -253,8 +411,16 @@ def generate_annotation_plan(
 学生作答条目（{segment_hint}）：
 {chr(10).join(serialized)}
 """.strip()
-
-    raw = call_model(protocol, api_key, base_url, model, system_prompt, user_prompt)
+    if use_model_file_inputs and protocol != "Anthropic兼容":
+        attach_paths = list(question_file_paths or [])
+        if reference_file_path:
+            attach_paths.append(reference_file_path)
+        if attach_paths:
+            raw = call_openai_compatible_with_files(api_key, base_url, model, system_prompt, user_prompt, attach_paths)
+        else:
+            raw = call_model(protocol, api_key, base_url, model, system_prompt, user_prompt)
+    else:
+        raw = call_model(protocol, api_key, base_url, model, system_prompt, user_prompt)
     parsed = extract_json(raw)
     if not parsed:
         return {"overall": "整体完成较认真，建议根据题目要求进一步完善关键步骤。", "items": []}
@@ -283,12 +449,55 @@ def generate_learning_analysis(
     question_text: str,
     student_text: str,
     reference_text: str = "",
+    question_file_paths: list[Path] | None = None,
+    reference_file_path: Path | None = None,
+    use_model_file_inputs: bool = False,
 ) -> dict[str, Any]:
     system_prompt = (
         "你是教学评估专家。你只返回JSON，不要返回Markdown或解释。"
         "结论应客观、可落地、可用于教学跟进。"
     )
-    user_prompt = f"""
+    if use_model_file_inputs:
+        material_names = [p.name for p in (question_file_paths or [])]
+        if reference_file_path:
+            material_names.append(reference_file_path.name)
+        materials_desc = "、".join(material_names) if material_names else "未附加"
+        user_prompt = f"""
+请基于题目要求和学生作答，输出该学生的学情分析。
+
+输出JSON格式必须是：
+{{
+  "student_id": "{student_id}",
+  "overall_mastery": "总体掌握结论，不超过80字",
+  "requirements": [
+    {{
+      "point": "题目要求点",
+      "status": "已完成/部分完成/未完成",
+      "evidence": "作答证据，不超过80字",
+      "advice": "改进建议，不超过60字"
+    }}
+  ],
+  "knowledge_mastery": [
+    {{
+      "topic": "知识点",
+      "level": "熟练/基本掌握/待加强",
+      "analysis": "分析，不超过80字"
+    }}
+  ]
+}}
+
+要求：
+1) requirements 至少3条，最多8条，尽量覆盖题目关键要求。
+2) status 仅能使用：已完成、部分完成、未完成。
+3) knowledge_mastery 至少3条，最多8条。
+4) 不要输出任何JSON以外文本。
+5) 题目、材料和参考样例已经作为文件附件提供：{materials_desc}。
+
+学生作答：
+{student_text[:8000]}
+""".strip()
+    else:
+        user_prompt = f"""
 请基于题目要求和学生作答，输出该学生的学情分析。
 
 输出JSON格式必须是：
@@ -327,8 +536,16 @@ def generate_learning_analysis(
 学生作答：
 {student_text[:8000]}
 """.strip()
-
-    raw = call_model(protocol, api_key, base_url, model, system_prompt, user_prompt)
+    if use_model_file_inputs and protocol != "Anthropic兼容":
+        attach_paths = list(question_file_paths or [])
+        if reference_file_path:
+            attach_paths.append(reference_file_path)
+        if attach_paths:
+            raw = call_openai_compatible_with_files(api_key, base_url, model, system_prompt, user_prompt, attach_paths)
+        else:
+            raw = call_model(protocol, api_key, base_url, model, system_prompt, user_prompt)
+    else:
+        raw = call_model(protocol, api_key, base_url, model, system_prompt, user_prompt)
     parsed = extract_json(raw)
     if not parsed:
         return {
@@ -509,6 +726,9 @@ def annotate_word(
     model: str,
     question_text: str,
     reference_text: str,
+    question_file_paths: list[Path] | None = None,
+    reference_file_path: Path | None = None,
+    use_model_file_inputs: bool = False,
 ) -> tuple[Path, str, str]:
     docx_path = ensure_docx(student_path)
     doc = Document(str(docx_path))
@@ -523,7 +743,19 @@ def annotate_word(
             segment_map[idx] = (para, txt)
             idx += 1
 
-    plan = generate_annotation_plan(protocol, api_key, base_url, model, question_text, segments, "Word段落", reference_text)
+    plan = generate_annotation_plan(
+        protocol,
+        api_key,
+        base_url,
+        model,
+        question_text,
+        segments,
+        "Word段落",
+        reference_text,
+        question_file_paths=question_file_paths,
+        reference_file_path=reference_file_path,
+        use_model_file_inputs=use_model_file_inputs,
+    )
 
     if doc.paragraphs:
         add_comment_to_paragraph(doc, doc.paragraphs[0], f"总评：{plan['overall']}")
@@ -553,6 +785,7 @@ def grade_homework(
     base_url: str,
     model: str,
     output_dir: Path,
+    use_model_file_inputs: bool = False,
 ) -> tuple[Path, str, Path]:
     ext = student_path.suffix.lower()
     if ext not in STUDENT_WORD_EXT:
@@ -560,33 +793,113 @@ def grade_homework(
     normalized_student_id = normalize_student_id(student_id)
 
     teacher_paths = [question_path] + (teacher_material_paths or [])
-    teacher_text_parts = []
-    for p in teacher_paths:
-        teacher_text_parts.append(f"[教师材料: {p.name}]")
-        teacher_text_parts.append(extract_text(p))
-    question_text = normalize_text("\n\n".join(teacher_text_parts))
-    reference_text = extract_text(reference_path) if reference_path else ""
-    output_path, overall, student_text = annotate_word(
-        student_path,
-        normalized_student_id,
-        output_dir,
-        protocol,
-        api_key,
-        base_url,
-        model,
-        question_text,
-        reference_text,
-    )
-    analysis = generate_learning_analysis(
-        protocol=protocol,
-        api_key=api_key,
-        base_url=base_url,
-        model=model,
-        student_id=normalized_student_id,
-        question_text=question_text,
-        student_text=student_text,
-        reference_text=reference_text,
-    )
+    use_file_mode = use_model_file_inputs and protocol != "Anthropic兼容"
+
+    def _build_text_context(context_teacher_paths: list[Path], context_reference_path: Path | None) -> tuple[str, str]:
+        teacher_text_parts = []
+        for p in context_teacher_paths:
+            teacher_text_parts.append(f"[教师材料: {p.name}]")
+            teacher_text_parts.append(extract_text(p))
+        question_txt = normalize_text("\n\n".join(teacher_text_parts))
+        reference_txt = extract_text(context_reference_path) if context_reference_path else ""
+        return question_txt, reference_txt
+
+    if use_file_mode:
+        file_teacher_paths, text_teacher_paths = split_file_api_supported(teacher_paths)
+        file_reference_path = None
+        text_reference_path = reference_path
+        if reference_path and reference_path.suffix.lower() in FILE_API_SUPPORTED_EXT:
+            file_reference_path = reference_path
+            text_reference_path = None
+        question_text, reference_text = _build_text_context(text_teacher_paths, text_reference_path)
+        try:
+            output_path, overall, student_text = annotate_word(
+                student_path,
+                normalized_student_id,
+                output_dir,
+                protocol,
+                api_key,
+                base_url,
+                model,
+                question_text,
+                reference_text,
+                question_file_paths=file_teacher_paths,
+                reference_file_path=file_reference_path,
+                use_model_file_inputs=True,
+            )
+            analysis = generate_learning_analysis(
+                protocol=protocol,
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
+                student_id=normalized_student_id,
+                question_text=question_text,
+                student_text=student_text,
+                reference_text=reference_text,
+                question_file_paths=file_teacher_paths,
+                reference_file_path=file_reference_path,
+                use_model_file_inputs=True,
+            )
+        except Exception as exc:
+            if not is_file_input_unsupported_error(exc):
+                raise
+            question_text, reference_text = _build_text_context(teacher_paths, reference_path)
+            output_path, overall, student_text = annotate_word(
+                student_path,
+                normalized_student_id,
+                output_dir,
+                protocol,
+                api_key,
+                base_url,
+                model,
+                question_text,
+                reference_text,
+                question_file_paths=teacher_paths,
+                reference_file_path=reference_path,
+                use_model_file_inputs=False,
+            )
+            analysis = generate_learning_analysis(
+                protocol=protocol,
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
+                student_id=normalized_student_id,
+                question_text=question_text,
+                student_text=student_text,
+                reference_text=reference_text,
+                question_file_paths=teacher_paths,
+                reference_file_path=reference_path,
+                use_model_file_inputs=False,
+            )
+    else:
+        question_text, reference_text = _build_text_context(teacher_paths, reference_path)
+        output_path, overall, student_text = annotate_word(
+            student_path,
+            normalized_student_id,
+            output_dir,
+            protocol,
+            api_key,
+            base_url,
+            model,
+            question_text,
+            reference_text,
+            question_file_paths=teacher_paths,
+            reference_file_path=reference_path,
+            use_model_file_inputs=False,
+        )
+        analysis = generate_learning_analysis(
+            protocol=protocol,
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            student_id=normalized_student_id,
+            question_text=question_text,
+            student_text=student_text,
+            reference_text=reference_text,
+            question_file_paths=teacher_paths,
+            reference_file_path=reference_path,
+            use_model_file_inputs=False,
+        )
     analysis_path = save_learning_analysis_report(normalized_student_id, student_path, analysis, output_dir)
     return output_path, overall, analysis_path
 
@@ -657,6 +970,11 @@ def main() -> None:
         if protocol == "Anthropic兼容":
             default_base_url = DEFAULT_ANTHROPIC_BASE_URL
         base_url = st.text_input("Base URL", value=default_base_url)
+        use_model_file_inputs = st.checkbox(
+            "直传文件给模型（实验）",
+            value=False,
+            help="启用后将题目/材料/样例文件作为附件直接发送给模型，不再在本地解析这些文件。",
+        )
 
         st.markdown("### 支持格式")
         st.write("- 题目/材料：`pdf/doc/docx/xls/xlsx`")
@@ -735,6 +1053,7 @@ def main() -> None:
                     base_url,
                     model,
                     OUTPUT_DIR,
+                    use_model_file_inputs=use_model_file_inputs,
                 )
 
                 st.success("批改完成")

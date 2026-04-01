@@ -22,6 +22,12 @@ def main() -> None:
     protocol = "OpenAI兼容"
     base_url = os.getenv("ARK_BASE_URL", DEFAULT_OPENAI_BASE_URL)
     model = os.getenv("ARK_MODEL", DEFAULT_MODEL)
+    use_model_file_inputs = os.getenv("USE_MODEL_FILE_INPUTS", "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
     root = Path(__file__).resolve().parent
     question_path = require_file(root / "example" / "Excel实验题目要求.pdf")
@@ -40,6 +46,7 @@ def main() -> None:
         base_url=base_url,
         model=model,
         output_dir=root / "outputs",
+        use_model_file_inputs=use_model_file_inputs,
     )
 
     print(str(output_path.resolve()))
