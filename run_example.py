@@ -6,6 +6,12 @@ from dotenv import load_dotenv
 from app import DEFAULT_MODEL, DEFAULT_OPENAI_BASE_URL, grade_homework
 
 
+def require_file(path: Path) -> Path:
+    if not path.exists() or not path.is_file():
+        raise FileNotFoundError(f"示例文件不存在: {path}")
+    return path
+
+
 def main() -> None:
     load_dotenv()
 
@@ -18,16 +24,17 @@ def main() -> None:
     model = os.getenv("ARK_MODEL", DEFAULT_MODEL)
 
     root = Path(__file__).resolve().parent
-    question_path = root / "example" / "Excel实验题目要求.pdf"
-    student_path = root / "example" / "Excel实验报告-待批改.docx"
-    reference_path = root / "example" / "Excel实验报告-批改后.docx"
+    question_path = require_file(root / "example" / "Excel实验题目要求.pdf")
+    student_path = require_file(root / "example" / "Excel实验报告-待批改.docx")
+    reference_path = require_file(root / "example" / "Excel实验报告-批改后.docx")
+    excel_material_path = require_file(root / "example" / "Excel实验原始素材文件.xlsx")
 
     output_path, overall, analysis_path = grade_homework(
         question_path=question_path,
         student_path=student_path,
         student_id="demo_001",
         reference_path=reference_path,
-        teacher_material_paths=[],
+        teacher_material_paths=[excel_material_path],
         protocol=protocol,
         api_key=api_key,
         base_url=base_url,
