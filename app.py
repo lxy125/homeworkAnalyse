@@ -219,10 +219,18 @@ def call_openai_compatible_with_files(
     client = OpenAI(api_key=api_key, base_url=file_base_url)
     uploaded_file_ids: list[str] = []
     try:
-        for file_path in file_paths:
-            with file_path.open("rb") as f:
-                uploaded = client.files.create(file=(file_path.name, f), purpose="user_data")
-                uploaded_file_ids.append(uploaded.id)
+        for idx, file_path in enumerate(file_paths, start=1):
+            # 避免 Linux/部分网关在 multipart filename 仅支持 ASCII 时因中文文件名报错。
+            safe_name = re.sub(r"[^0-9A-Za-z_.-]+", "_", file_path.name).strip("._")
+            if not safe_name:
+                safe_name = f"upload_{idx}{file_path.suffix.lower()}"
+            # 不直接传文件对象，避免 SDK 在 multipart 里回退使用原始中文路径名导致 ASCII 编码异常。
+            file_bytes = file_path.read_bytes()
+            uploaded = client.files.create(
+                file=(safe_name, file_bytes, "application/octet-stream"),
+                purpose="user_data",
+            )
+            uploaded_file_ids.append(uploaded.id)
             deadline = time.time() + 300
             while True:
                 meta = client.files.retrieve(uploaded.id)
@@ -259,7 +267,17 @@ def call_openai_compatible_with_files(
 
 def is_file_input_unsupported_error(exc: Exception) -> bool:
     text = str(exc).lower()
-    keywords = ["404", "/files", "notfound", "unsupported", "input_file", "file type not supported"]
+    keywords = [
+        "404",
+        "/files",
+        "notfound",
+        "unsupported",
+        "input_file",
+        "file type not supported",
+        "unicodeencodeerror",
+        "'ascii' codec can't encode",
+        "ordinal not in range(128)",
+    ]
     return any(k in text for k in keywords)
 
 
@@ -1110,46 +1128,55 @@ def main() -> None:
                     OUTPUT_DIR,
                     use_model_file_inputs=use_model_file_inputs,
                 )
-                kp_results = kp_event.get("payload", {}).get("results", [])
-                ingest_url = member4_ingest_url.strip() or DEFAULT_MEMBER4_INGEST_URL
-                push_result = post_member4_event(
-                    ingest_url=ingest_url,
-                    user_id=normalized_student_id,
-                    source_id=source_id.strip() or DEFAULT_SOURCE_ID,
-                    results=kp_results,
-                )
-
-                st.success("批改完成")
-                st.write(f"总评：{overall}")
-                st.code(f"输出文件：{output_path.resolve()}")
-                st.markdown("### 知识点正确性结果")
-                st.json(
-                    {
-                        "events": [
-                            {
-                                "user_id": normalized_student_id,
-                                "class_id": CLASS_ID,
-                                "course_id": COURSE_ID,
-                                "event_type": EVENT_TYPE,
-                                "payload": {
-                                    "source_id": source_id.strip() or DEFAULT_SOURCE_ID,
-                                    "source_type": SOURCE_TYPE,
-                                    "results": kp_results,
-                                },
-                            }
-                        ]
-                    }
-                )
-                st.markdown("### 成员4推送结果")
-                st.json(push_result)
-                st.download_button(
-                    "下载批改后文件",
-                    data=output_path.read_bytes(),
-                    file_name=output_path.name,
-                    mime="application/octet-stream",
-                )
             except Exception as exc:
                 st.error(f"批改失败：{exc}")
+                return
+
+        kp_results = kp_event.get("payload", {}).get("results", [])
+        source_id_value = source_id.strip() or DEFAULT_SOURCE_ID
+        ingest_url = member4_ingest_url.strip() or DEFAULT_MEMBER4_INGEST_URL
+        structured_event = {
+            "events": [
+                {
+                    "user_id": normalized_student_id,
+                    "class_id": CLASS_ID,
+                    "course_id": COURSE_ID,
+                    "event_type": EVENT_TYPE,
+                    "payload": {
+                        "source_id": source_id_value,
+                        "source_type": SOURCE_TYPE,
+                        "results": kp_results,
+                    },
+                }
+            ]
+        }
+
+        st.success("批改完成（文档已生成）")
+        st.write(f"总评：{overall}")
+        st.code(f"输出文件：{output_path.resolve()}")
+        st.markdown("### 知识点正确性结果")
+        st.json(structured_event)
+        st.download_button(
+            "下载批改后文件",
+            data=output_path.read_bytes(),
+            file_name=output_path.name,
+            mime="application/octet-stream",
+        )
+
+        st.markdown("### 成员4推送结果")
+        try:
+            push_result = post_member4_event(
+                ingest_url=ingest_url,
+                user_id=normalized_student_id,
+                source_id=source_id_value,
+                results=kp_results,
+            )
+            st.success("成员4推送成功")
+            st.json(push_result)
+        except Exception as exc:
+            st.warning("成员4推送失败，但批改文档已生成。")
+            st.error(f"推送失败：{exc}")
+            st.json({"request": structured_event, "ingest_url": ingest_url})
 
 
 if __name__ == "__main__":
