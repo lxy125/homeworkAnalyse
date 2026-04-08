@@ -8,7 +8,7 @@
 4. 学生上传待批改作业（仅 `doc/docx`）
 5. 可选上传老师历史批改样例（同格式）
 6. 系统调用 `doubao-seed-2.0-pro` 生成批注并输出 Word 文档（文件名包含学生ID）
-7. 同时输出该学生的学情分析文件（包含要求点完成情况与知识掌握程度）
+7. 同时输出结构化知识点正确性结果，并主动推送到成员4接口（`events/ingest`）
 
 ## 环境
 
@@ -25,6 +25,7 @@ pip install -r requirements.txt
 ARK_API_KEY=你的apikey
 ARK_BASE_URL=https://ark.cn-beijing.volces.com/api/coding/v3
 ARK_MODEL=doubao-seed-2.0-pro
+MEMBER4_INGEST_URL=http://127.0.0.1:8007/api/v1/analytics/events/ingest
 ```
 
 支持两种协议：
@@ -76,7 +77,8 @@ python run_example.py
 - 题目文件：支持读取 `.doc/.docx/.pdf/.xls/.xlsx`
 - 学生作业：仅支持 `.doc/.docx`
 - 批注输出：`docx`，以 Word 原生“批注（评论气泡）”写入
-- 学情分析输出：`docx`，包含学生ID、题目要求逐点完成情况、知识掌握程度分析
+- 结构化输出：`events` 包裹格式，`results` 为知识点编码 + 布尔正确性
+- 固定值：`class_id=class-demo`、`course_id=course_oop_design`、`source_type=assignment`
 
 Linux 部署说明：
 

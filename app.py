@@ -33,6 +33,7 @@ QUESTION_EXT = {".doc", ".docx", ".pdf", ".xls", ".xlsx"}
 STUDENT_WORD_EXT = {".doc", ".docx"}
 FILE_API_SUPPORTED_EXT = {
     ".pdf",
+    ".docx",
     ".jpg",
     ".jpeg",
     ".png",
@@ -52,6 +53,22 @@ FILE_API_SUPPORTED_EXT = {
 }
 OUTPUT_DIR = Path("outputs")
 OUTPUT_DIR.mkdir(exist_ok=True)
+CLASS_ID = "class-demo"
+COURSE_ID = "course_oop_design"
+SOURCE_TYPE = "assignment"
+EVENT_TYPE = "GRADING_RESULT_RECEIVED"
+DEFAULT_SOURCE_ID = "assignment-001"
+DEFAULT_MEMBER4_INGEST_URL = "http://127.0.0.1:8007/api/v1/analytics/events/ingest"
+COURSE_KNOWLEDGE_POINTS = [
+    {"id": "kp_object_oriented_basics", "name": "面向对象基础"},
+    {"id": "kp_class_and_object", "name": "类与对象"},
+    {"id": "kp_encapsulation_and_access_control", "name": "封装与访问控制"},
+    {"id": "kp_inheritance", "name": "继承"},
+    {"id": "kp_polymorphism", "name": "多态"},
+    {"id": "kp_abstract_class_and_interface", "name": "抽象类与接口"},
+    {"id": "kp_exception_handling", "name": "异常处理"},
+    {"id": "kp_common_collections_and_generics", "name": "常用集合与泛型"},
+]
 
 
 def now_suffix() -> str:
@@ -247,26 +264,76 @@ def is_file_input_unsupported_error(exc: Exception) -> bool:
 
 
 def convert_legacy_office_file(file_path: Path, target_ext: str) -> Path:
-    soffice = shutil.which("soffice")
-    if not soffice:
-        raise ValueError(
-            f"文件 `{file_path.name}` 为旧格式 `{file_path.suffix}`，当前环境无法直接解析。"
-            f"请改传 `{target_ext}`，或在服务器安装 LibreOffice（soffice）后自动转换。"
-        )
+    def _powershell_escape(path: str) -> str:
+        return path.replace("'", "''")
 
+    def _convert_with_windows_office(src: Path, dst: Path, dst_ext: str) -> bool:
+        # Windows 下使用已安装的 Office 进行转换，作为 soffice 不可用时的兜底。
+        src_esc = _powershell_escape(str(src.resolve()))
+        dst_esc = _powershell_escape(str(dst.resolve()))
+        if dst_ext == ".docx":
+            script = f"""
+$ErrorActionPreference = 'Stop'
+$word = $null
+$doc = $null
+try {{
+  $word = New-Object -ComObject Word.Application
+  $word.Visible = $false
+  $doc = $word.Documents.Open('{src_esc}')
+  $doc.SaveAs2('{dst_esc}', 16)
+}} finally {{
+  if ($doc -ne $null) {{ $doc.Close([ref]$false) }}
+  if ($word -ne $null) {{ $word.Quit() }}
+}}
+""".strip()
+        elif dst_ext == ".xlsx":
+            script = f"""
+$ErrorActionPreference = 'Stop'
+$excel = $null
+$wb = $null
+try {{
+  $excel = New-Object -ComObject Excel.Application
+  $excel.Visible = $false
+  $excel.DisplayAlerts = $false
+  $wb = $excel.Workbooks.Open('{src_esc}')
+  $wb.SaveAs('{dst_esc}', 51)
+}} finally {{
+  if ($wb -ne $null) {{ $wb.Close($false) }}
+  if ($excel -ne $null) {{ $excel.Quit() }}
+}}
+""".strip()
+        else:
+            return False
+
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return result.returncode == 0 and dst.exists()
+
+    soffice = shutil.which("soffice")
     temp_dir = Path(tempfile.mkdtemp(prefix="office_convert_"))
     convert_to = target_ext.lstrip(".")
-    result = subprocess.run(
-        [soffice, "--headless", "--convert-to", convert_to, "--outdir", str(temp_dir), str(file_path)],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
     converted = temp_dir / f"{file_path.stem}.{convert_to}"
-    if result.returncode != 0 or not converted.exists():
-        err = (result.stderr or result.stdout or "").strip()
-        raise ValueError(f"无法将 `{file_path.name}` 转换为 `{target_ext}`。{err}")
-    return converted
+    if soffice:
+        result = subprocess.run(
+            [soffice, "--headless", "--convert-to", convert_to, "--outdir", str(temp_dir), str(file_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0 and converted.exists():
+            return converted
+
+    if os.name == "nt" and _convert_with_windows_office(file_path, converted, target_ext):
+        return converted
+
+    raise ValueError(
+        f"文件 `{file_path.name}` 为旧格式 `{file_path.suffix}`，当前环境无法直接解析。"
+        f"请改传 `{target_ext}`，或安装 LibreOffice（soffice）/本机 Office 组件后自动转换。"
+    )
 
 
 def ensure_docx(file_path: Path) -> Path:
@@ -346,6 +413,7 @@ def generate_annotation_plan(
     reference_text: str = "",
     question_file_paths: list[Path] | None = None,
     reference_file_path: Path | None = None,
+    student_file_path: Path | None = None,
     use_model_file_inputs: bool = False,
 ) -> dict[str, Any]:
     system_prompt = (
@@ -353,15 +421,16 @@ def generate_annotation_plan(
         "批注要简短，聚焦知识点与改进建议。"
     )
 
-    limited_segments = student_segments[:50]
     serialized = []
-    for item in limited_segments:
+    for item in student_segments:
         serialized.append(f"index={item['index']} | content={item['text']}")
 
     if use_model_file_inputs:
         material_names = [p.name for p in (question_file_paths or [])]
         if reference_file_path:
             material_names.append(reference_file_path.name)
+        if student_file_path and student_file_path.suffix.lower() in FILE_API_SUPPORTED_EXT:
+            material_names.append(student_file_path.name)
         materials_desc = "、".join(material_names) if material_names else "未附加"
         user_prompt = f"""
 请依据题目与学生作答给出批注计划。
@@ -375,11 +444,11 @@ def generate_annotation_plan(
 }}
 
 要求：
-1) items 只包含需要批注的条目，最多10条。
+1) items 只包含需要批注的条目，最多20条。
 2) index 必须来自我提供的 index。
 3) comment 使用中文。
 4) 不要输出任何JSON以外文本。
-5) 题目、材料和参考样例已经作为文件附件提供：{materials_desc}。
+5) 题目、材料、参考样例和学生作答文档已经作为文件附件提供：{materials_desc}。
 
 学生作答条目（{segment_hint}）：
 {chr(10).join(serialized)}
@@ -397,16 +466,16 @@ def generate_annotation_plan(
 }}
 
 要求：
-1) items 只包含需要批注的条目，最多10条。
+1) items 只包含需要批注的条目，最多20条。
 2) index 必须来自我提供的 index。
 3) comment 使用中文。
 4) 不要输出任何JSON以外文本。
 
 题目：
-{question_text[:6000]}
+{question_text}
 
 参考老师批改样例（可选）：
-{reference_text[:3000] if reference_text else '无'}
+{reference_text if reference_text else '无'}
 
 学生作答条目（{segment_hint}）：
 {chr(10).join(serialized)}
@@ -415,6 +484,8 @@ def generate_annotation_plan(
         attach_paths = list(question_file_paths or [])
         if reference_file_path:
             attach_paths.append(reference_file_path)
+        if student_file_path and student_file_path.suffix.lower() in FILE_API_SUPPORTED_EXT:
+            attach_paths.append(student_file_path)
         if attach_paths:
             raw = call_openai_compatible_with_files(api_key, base_url, model, system_prompt, user_prompt, attach_paths)
         else:
@@ -440,7 +511,40 @@ def generate_annotation_plan(
     return {"overall": overall[:120], "items": normalized_items}
 
 
-def generate_learning_analysis(
+def _coerce_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return bool(value)
+    if isinstance(value, str):
+        raw = value.strip().lower()
+        if raw in {"true", "1", "yes", "y"}:
+            return True
+        if raw in {"false", "0", "no", "n"}:
+            return False
+    return None
+
+
+def _normalize_knowledge_point_results(raw_results: Any) -> list[dict[str, Any]]:
+    allowed_ids = {item["id"] for item in COURSE_KNOWLEDGE_POINTS}
+    if not isinstance(raw_results, list):
+        return []
+
+    normalized: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for item in raw_results:
+        if not isinstance(item, dict):
+            continue
+        kp_id = str(item.get("knowledge_point_id", "")).strip()
+        is_correct = _coerce_bool(item.get("is_correct"))
+        if kp_id not in allowed_ids or is_correct is None or kp_id in seen_ids:
+            continue
+        seen_ids.add(kp_id)
+        normalized.append({"knowledge_point_id": kp_id, "is_correct": is_correct})
+    return normalized
+
+
+def generate_knowledge_point_results(
     protocol: str,
     api_key: str,
     base_url: str,
@@ -455,76 +559,62 @@ def generate_learning_analysis(
 ) -> dict[str, Any]:
     system_prompt = (
         "你是教学评估专家。你只返回JSON，不要返回Markdown或解释。"
-        "结论应客观、可落地、可用于教学跟进。"
+        "请严格根据题目和作答判断涉及知识点及是否基本正确。"
     )
+    course_schema = {
+        "course_id": COURSE_ID,
+        "course_name": "面向对象程序设计",
+        "knowledge_points": COURSE_KNOWLEDGE_POINTS,
+    }
     if use_model_file_inputs:
         material_names = [p.name for p in (question_file_paths or [])]
         if reference_file_path:
             material_names.append(reference_file_path.name)
         materials_desc = "、".join(material_names) if material_names else "未附加"
         user_prompt = f"""
-请基于题目要求和学生作答，输出该学生的学情分析。
+请根据题目内容、学生作答内容、课程知识点列表，判断学生作答涉及了哪些知识点，并判断每个知识点是否基本回答正确。
 
 输出JSON格式必须是：
 {{
-  "student_id": "{student_id}",
-  "overall_mastery": "总体掌握结论，不超过80字",
-  "requirements": [
+  "results": [
     {{
-      "point": "题目要求点",
-      "status": "已完成/部分完成/未完成",
-      "evidence": "作答证据，不超过80字",
-      "advice": "改进建议，不超过60字"
-    }}
-  ],
-  "knowledge_mastery": [
-    {{
-      "topic": "知识点",
-      "level": "熟练/基本掌握/待加强",
-      "analysis": "分析，不超过80字"
+      "knowledge_point_id": "必须是下方知识点id之一",
+      "is_correct": true
     }}
   ]
 }}
 
 要求：
-1) requirements 至少3条，最多8条，尽量覆盖题目关键要求。
-2) status 仅能使用：已完成、部分完成、未完成。
-3) knowledge_mastery 至少3条，最多8条。
+1) knowledge_point_id 只能从下面列表中选择，禁止输出列表之外的id。
+2) is_correct 必须是布尔值 true 或 false。
+3) 仅输出学生作答中涉及到的知识点。
 4) 不要输出任何JSON以外文本。
 5) 题目、材料和参考样例已经作为文件附件提供：{materials_desc}。
+
+课程知识点列表：
+{json.dumps(course_schema, ensure_ascii=False, indent=2)}
 
 学生作答：
 {student_text[:8000]}
 """.strip()
     else:
         user_prompt = f"""
-请基于题目要求和学生作答，输出该学生的学情分析。
+请根据题目内容、学生作答内容、课程知识点列表，判断学生作答涉及了哪些知识点，并判断每个知识点是否基本回答正确。
 
 输出JSON格式必须是：
 {{
-  "student_id": "{student_id}",
-  "overall_mastery": "总体掌握结论，不超过80字",
-  "requirements": [
+  "results": [
     {{
-      "point": "题目要求点",
-      "status": "已完成/部分完成/未完成",
-      "evidence": "作答证据，不超过80字",
-      "advice": "改进建议，不超过60字"
-    }}
-  ],
-  "knowledge_mastery": [
-    {{
-      "topic": "知识点",
-      "level": "熟练/基本掌握/待加强",
-      "analysis": "分析，不超过80字"
+      "knowledge_point_id": "必须是下方知识点id之一",
+      "is_correct": true
     }}
   ]
 }}
 
 要求：
-1) requirements 至少3条，最多8条，尽量覆盖题目关键要求。
-2) status 仅能使用：已完成、部分完成、未完成。
-3) knowledge_mastery 至少3条，最多8条。
+1) knowledge_point_id 只能从下面列表中选择，禁止输出列表之外的id。
+2) is_correct 必须是布尔值 true 或 false。
+3) 仅输出学生作答中涉及到的知识点。
 4) 不要输出任何JSON以外文本。
 
 题目与教师材料：
@@ -532,6 +622,9 @@ def generate_learning_analysis(
 
 参考样例（可选）：
 {reference_text[:3000] if reference_text else '无'}
+
+课程知识点列表：
+{json.dumps(course_schema, ensure_ascii=False, indent=2)}
 
 学生作答：
 {student_text[:8000]}
@@ -547,92 +640,49 @@ def generate_learning_analysis(
     else:
         raw = call_model(protocol, api_key, base_url, model, system_prompt, user_prompt)
     parsed = extract_json(raw)
-    if not parsed:
-        return {
-            "student_id": student_id,
-            "overall_mastery": "当前可完成基础要求，综合应用与细节准确性仍需提升。",
-            "requirements": [],
-            "knowledge_mastery": [],
-        }
-
-    overall = str(parsed.get("overall_mastery", "")).strip() or "当前可完成基础要求，综合应用与细节准确性仍需提升。"
-
-    requirements = []
-    for item in parsed.get("requirements", []):
-        point = str(item.get("point", "")).strip()
-        status = str(item.get("status", "")).strip()
-        evidence = str(item.get("evidence", "")).strip()
-        advice = str(item.get("advice", "")).strip()
-        if not point:
-            continue
-        if status not in {"已完成", "部分完成", "未完成"}:
-            status = "部分完成"
-        requirements.append(
-            {
-                "point": point[:120],
-                "status": status,
-                "evidence": evidence[:160],
-                "advice": advice[:120],
-            }
-        )
-
-    knowledge_mastery = []
-    for item in parsed.get("knowledge_mastery", []):
-        topic = str(item.get("topic", "")).strip()
-        level = str(item.get("level", "")).strip()
-        analysis = str(item.get("analysis", "")).strip()
-        if not topic:
-            continue
-        if level not in {"熟练", "基本掌握", "待加强"}:
-            level = "基本掌握"
-        knowledge_mastery.append(
-            {
-                "topic": topic[:120],
-                "level": level,
-                "analysis": analysis[:160],
-            }
-        )
-
+    results = _normalize_knowledge_point_results(parsed.get("results", []) if parsed else [])
     return {
-        "student_id": student_id,
-        "overall_mastery": overall[:160],
-        "requirements": requirements[:8],
-        "knowledge_mastery": knowledge_mastery[:8],
+        "user_id": student_id,
+        "class_id": CLASS_ID,
+        "course_id": COURSE_ID,
+        "event_type": EVENT_TYPE,
+        "payload": {
+            "source_id": DEFAULT_SOURCE_ID,
+            "source_type": SOURCE_TYPE,
+            "results": results,
+        },
     }
 
 
-def save_learning_analysis_report(student_id: str, student_path: Path, analysis: dict[str, Any], output_dir: Path) -> Path:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    report_path = output_dir / f"{student_path.stem}-学生ID-{student_id}-学情分析-{now_suffix()}.docx"
-
-    doc = Document()
-    doc.add_heading("学情分析报告", level=1)
-    doc.add_paragraph(f"学生ID：{analysis.get('student_id') or student_id}")
-    doc.add_paragraph(f"综合掌握结论：{analysis.get('overall_mastery', '')}")
-
-    doc.add_heading("题目要求完成情况", level=2)
-    requirements = analysis.get("requirements", [])
-    if requirements:
-        for idx, item in enumerate(requirements, start=1):
-            doc.add_paragraph(f"{idx}. 要求点：{item.get('point', '')}")
-            doc.add_paragraph(f"完成状态：{item.get('status', '')}")
-            doc.add_paragraph(f"作答证据：{item.get('evidence', '') or '未提取到明确证据'}")
-            doc.add_paragraph(f"改进建议：{item.get('advice', '') or '建议补充关键步骤与依据'}")
-    else:
-        doc.add_paragraph("1. 暂未提取到结构化要求点，请结合批注报告复核。")
-
-    doc.add_heading("知识掌握程度分析", level=2)
-    knowledges = analysis.get("knowledge_mastery", [])
-    if knowledges:
-        for idx, item in enumerate(knowledges, start=1):
-            doc.add_paragraph(f"{idx}. 知识点：{item.get('topic', '')}")
-            doc.add_paragraph(f"掌握程度：{item.get('level', '')}")
-            doc.add_paragraph(f"分析：{item.get('analysis', '') or '建议在练习中强化迁移应用。'}")
-    else:
-        doc.add_paragraph("1. 暂未提取到结构化知识点，请结合批注报告复核。")
-
-    doc.save(str(report_path.resolve()))
-    return report_path
+def post_member4_event(
+    ingest_url: str,
+    user_id: str,
+    source_id: str,
+    results: list[dict[str, Any]],
+) -> dict[str, Any]:
+    event = {
+        "user_id": user_id,
+        "class_id": CLASS_ID,
+        "course_id": COURSE_ID,
+        "event_type": EVENT_TYPE,
+        "payload": {
+            "source_id": source_id,
+            "source_type": SOURCE_TYPE,
+            "results": results,
+        },
+    }
+    request_body = {"events": [event]}
+    with httpx.Client(timeout=20.0) as client:
+        response = client.post(ingest_url, json=request_body)
+        response.raise_for_status()
+        content_type = response.headers.get("content-type", "")
+        response_body: Any = response.text
+        if "application/json" in content_type.lower():
+            try:
+                response_body = response.json()
+            except Exception:
+                response_body = response.text
+        return {"request": request_body, "status_code": response.status_code, "response_body": response_body}
 
 
 def get_or_add_comments_part(document: Document) -> XmlPart:
@@ -754,6 +804,7 @@ def annotate_word(
         reference_text,
         question_file_paths=question_file_paths,
         reference_file_path=reference_file_path,
+        student_file_path=docx_path,
         use_model_file_inputs=use_model_file_inputs,
     )
 
@@ -786,7 +837,7 @@ def grade_homework(
     model: str,
     output_dir: Path,
     use_model_file_inputs: bool = False,
-) -> tuple[Path, str, Path]:
+) -> tuple[Path, str, dict[str, Any]]:
     ext = student_path.suffix.lower()
     if ext not in STUDENT_WORD_EXT:
         raise ValueError(f"待批改文件必须是Word格式(doc/docx)，当前为：{ext}")
@@ -827,7 +878,7 @@ def grade_homework(
                 reference_file_path=file_reference_path,
                 use_model_file_inputs=True,
             )
-            analysis = generate_learning_analysis(
+            kp_event = generate_knowledge_point_results(
                 protocol=protocol,
                 api_key=api_key,
                 base_url=base_url,
@@ -858,7 +909,7 @@ def grade_homework(
                 reference_file_path=reference_path,
                 use_model_file_inputs=False,
             )
-            analysis = generate_learning_analysis(
+            kp_event = generate_knowledge_point_results(
                 protocol=protocol,
                 api_key=api_key,
                 base_url=base_url,
@@ -887,7 +938,7 @@ def grade_homework(
             reference_file_path=reference_path,
             use_model_file_inputs=False,
         )
-        analysis = generate_learning_analysis(
+        kp_event = generate_knowledge_point_results(
             protocol=protocol,
             api_key=api_key,
             base_url=base_url,
@@ -900,8 +951,7 @@ def grade_homework(
             reference_file_path=reference_path,
             use_model_file_inputs=False,
         )
-    analysis_path = save_learning_analysis_report(normalized_student_id, student_path, analysis, output_dir)
-    return output_path, overall, analysis_path
+    return output_path, overall, kp_event
 
 
 def save_upload(uploaded_file, target_dir: Path) -> Path:
@@ -972,14 +1022,19 @@ def main() -> None:
         base_url = st.text_input("Base URL", value=default_base_url)
         use_model_file_inputs = st.checkbox(
             "直传文件给模型（实验）",
-            value=False,
+            value=True,
             help="启用后将题目/材料/样例文件作为附件直接发送给模型，不再在本地解析这些文件。",
         )
+        member4_ingest_url = st.text_input(
+            "成员4 Ingest URL",
+            value=os.getenv("MEMBER4_INGEST_URL", DEFAULT_MEMBER4_INGEST_URL),
+        )
+        source_id = st.text_input("source_id", value=DEFAULT_SOURCE_ID, help="可使用 assignment-001 或任务ID")
 
         st.markdown("### 支持格式")
         st.write("- 题目/材料：`pdf/doc/docx/xls/xlsx`")
         st.write("- 学生作业：`doc/docx`")
-        st.write("- 输出：批注后的 `docx`")
+        st.write("- 输出：批注后的 `docx` + 结构化知识点结果")
         st.caption("提示：Linux 环境处理 .doc/.xls 需要安装 LibreOffice（soffice）自动转换。")
 
     with st.form("grading_form"):
@@ -1042,7 +1097,7 @@ def main() -> None:
                 student_path = save_upload(student_upload, work_dir)
                 reference_path = save_upload(reference_upload, work_dir) if reference_upload else None
 
-                output_path, overall, analysis_path = grade_homework(
+                output_path, overall, kp_event = grade_homework(
                     question_path,
                     student_path,
                     normalized_student_id,
@@ -1055,22 +1110,43 @@ def main() -> None:
                     OUTPUT_DIR,
                     use_model_file_inputs=use_model_file_inputs,
                 )
+                kp_results = kp_event.get("payload", {}).get("results", [])
+                ingest_url = member4_ingest_url.strip() or DEFAULT_MEMBER4_INGEST_URL
+                push_result = post_member4_event(
+                    ingest_url=ingest_url,
+                    user_id=normalized_student_id,
+                    source_id=source_id.strip() or DEFAULT_SOURCE_ID,
+                    results=kp_results,
+                )
 
                 st.success("批改完成")
                 st.write(f"总评：{overall}")
                 st.code(f"输出文件：{output_path.resolve()}")
-                st.code(f"学情分析：{analysis_path.resolve()}")
+                st.markdown("### 知识点正确性结果")
+                st.json(
+                    {
+                        "events": [
+                            {
+                                "user_id": normalized_student_id,
+                                "class_id": CLASS_ID,
+                                "course_id": COURSE_ID,
+                                "event_type": EVENT_TYPE,
+                                "payload": {
+                                    "source_id": source_id.strip() or DEFAULT_SOURCE_ID,
+                                    "source_type": SOURCE_TYPE,
+                                    "results": kp_results,
+                                },
+                            }
+                        ]
+                    }
+                )
+                st.markdown("### 成员4推送结果")
+                st.json(push_result)
                 st.download_button(
                     "下载批改后文件",
                     data=output_path.read_bytes(),
                     file_name=output_path.name,
                     mime="application/octet-stream",
-                )
-                st.download_button(
-                    "下载学情分析",
-                    data=analysis_path.read_bytes(),
-                    file_name=analysis_path.name,
-                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 )
             except Exception as exc:
                 st.error(f"批改失败：{exc}")
